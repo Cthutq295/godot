@@ -95,6 +95,12 @@ public:
 
 	real_t get_floor_snap_length();
 	void set_floor_snap_length(real_t p_floor_snap_length);
+	
+	bool is_step_enabled() const;
+	void set_step_enabled(bool p_enabled);
+
+	real_t get_step_height() const;
+	void set_step_height(real_t p_height);
 
 	real_t get_wall_min_slide_angle() const;
 	void set_wall_min_slide_angle(real_t p_radians);
@@ -149,6 +155,8 @@ private:
 	real_t floor_snap_length = 0.1;
 	real_t floor_max_angle = Math::deg_to_rad((real_t)45.0);
 	real_t wall_min_slide_angle = Math::deg_to_rad((real_t)15.0);
+	bool step_enabled = false;
+	real_t step_height = 0.3;
 	Vector3 up_direction = Vector3(0.0, 1.0, 0.0);
 	Vector3 velocity;
 	Vector3 floor_normal;
@@ -166,6 +174,7 @@ private:
 
 	void _move_and_slide_floating(double p_delta);
 	void _move_and_slide_grounded(double p_delta, bool p_was_on_floor);
+	bool _try_step_up(const Vector3 &p_remainder);
 
 	Ref<KinematicCollision3D> _get_slide_collision(int p_bounce);
 	Ref<KinematicCollision3D> _get_last_slide_collision();

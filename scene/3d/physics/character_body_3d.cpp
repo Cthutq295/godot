@@ -215,6 +215,15 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
 
 			// Wall collision checks.
 			if (result_state.wall && (motion_slide_up.dot(wall_normal) <= 0)) {
+				// Try step-up first if enabled and on floor
+				if (step_enabled && p_was_on_floor && !vel_dir_facing_up) {
+					if (_try_step_up(result.remainder)) {
+						// Step succeeded - character has been moved to stepped position
+						// Break out of loop, snap_on_floor will handle final floor detection
+						break;
+					}
+				}
+
 				// Move on floor only checks.
 				if (floor_block_on_wall) {
 					// Needs horizontal motion from current motion instead of motion_slide_up
@@ -236,7 +245,8 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
 							if (travel_total <= margin + CMP_EPSILON) {
 								gt.origin -= result.travel;
 								result.travel = Vector3(); // Cancel for constant speed computation.
-							} else if (travel_total < cancel_dist_max) { // If the movement is large the body can be prevented from reaching the walls.
+							} else if (travel_total < cancel_dist_max) {
+								// If the movement is large the body can be prevented from reaching the walls.
 								gt.origin -= result.travel.slide(up_direction);
 								// Keep remaining motion in sync with amount canceled.
 								motion = motion.slide(up_direction);
@@ -397,6 +407,203 @@ void CharacterBody3D::_move_and_slide_grounded(double p_delta, bool p_was_on_flo
 	if (collision_state.floor && !vel_dir_facing_up) {
 		velocity = velocity.slide(up_direction);
 	}
+}
+
+bool CharacterBody3D::_try_step_up(const Vector3 &p_remainder) {
+	if (step_height <= 0) {
+		return false;
+	}
+
+	PhysicsServer3D *ps = PhysicsServer3D::get_singleton();
+	const int shape_count = ps->body_get_shape_count(get_rid());
+
+	if (shape_count == 0) {
+		return false;
+	}
+
+	RID shape_rid = ps->body_get_shape(get_rid(), 0);
+	PhysicsServer3D::ShapeType type = ps->shape_get_type(shape_rid);
+
+	switch (type) {
+		case PhysicsServer3D::SHAPE_SPHERE:
+		case PhysicsServer3D::SHAPE_CAPSULE:
+		case PhysicsServer3D::SHAPE_BOX:
+		case PhysicsServer3D::SHAPE_CYLINDER:
+			break;
+		default:
+			return false;
+	}
+
+	Vector3 forward_motion = p_remainder.slide(up_direction);
+	float motion_len = forward_motion.length();
+	const float MIN_FORWARD_DIST = 0.05f;
+
+	if (motion_len < MIN_FORWARD_DIST) {
+		Vector3 vel_dir = velocity.slide(up_direction);
+		if (vel_dir.length_squared() > CMP_EPSILON) {
+			// Если скорость есть, мы берем ее направление и искусственно задаем 
+			// движение вперед ровно на 5 сантиметров.
+			forward_motion = vel_dir.normalized() * MIN_FORWARD_DIST;
+			print_line(vformat("[STEP_UP] vel_dir.length_squared() > CMP_EPSILON = forward_motion %s", forward_motion));
+		} else if (motion_len > CMP_EPSILON) {
+			// Скорости нет (игрок стоит), но есть микро-остаток пути (например его толкает другой объект).
+			// Растягиваем этот остаток пути до 5 сантиметров.
+			forward_motion = forward_motion.normalized() * MIN_FORWARD_DIST;
+			print_line(vformat("[STEP_UP] else if (motion_len > CMP_EPSILON) { forward_motion %s", forward_motion));
+		} else {
+			return false;
+		}
+	}
+
+	Transform3D start_transform = get_global_transform();
+	Transform3D test_transform = start_transform; // Будем виртуально двигать эту копию игрока.
+	PhysicsServer3D::MotionParameters params; // Настройки для "слепого прощупывания"
+	PhysicsServer3D::MotionResult result; // Сюда запишется результат: ударились мы или нет.
+	Vector3 up_motion = up_direction * step_height; // Это вектор, толкающий нас ровно вверх.
+
+	print_line(vformat("[STEP_UP] start_pos=%s  forward_motion(final)=%s", start_transform.origin, forward_motion));
+
+	// ================= ШАГ 1: ДВИЖЕМСЯ ВИРТУАЛЬНО ВВЕРХ =================
+	// Пытаемся поднять форму игрока над землей.
+	params = PhysicsServer3D::MotionParameters(test_transform, up_motion, margin);
+	params.recovery_as_collision = true;
+
+	// Делаем проверку на всю высоту шага, если упремся в потолок, то продолжать выполнение, так можно избежать цикла чтобы не делить шаг на 2 раза.
+	bool hit_ceiling = ps->body_test_motion(get_rid(), params, &result);
+
+	print_line(vformat("[STEP_UP] STEP1_UP: hit_ceiling=%s  collision_count=%d  travel=%s  travel_len=%.4f", hit_ceiling ? "YES" : "NO", result.collision_count, result.travel, result.travel.length()));
+
+	// Запоминаем, сколько реально удалось пройти вверх до препятствия
+	Vector3 actual_up_travel = result.travel;
+	// Если все чисто, поднимаем нашего виртуального "тестового" игрока на пройденное расстояние вверх.
+	test_transform.origin += actual_up_travel;
+
+	// ================= ШАГ 2: ДВИЖЕМСЯ ВИРТУАЛЬНО ВПЕРЕД =================
+	// Теперь игрок "висит в воздухе" над уровнем пола. Толкаем его вперед НАД ступенькой.
+	params = PhysicsServer3D::MotionParameters(test_transform, forward_motion, margin);
+	params.recovery_as_collision = true;
+
+	// Тестируем движение вперед.
+	ps->body_test_motion(get_rid(), params, &result);
+
+	// Если мы во что-то ударились во время движения вперед, значит ступенька оказалась выше, 
+	// чем мы ожидали (это высокая стена). Но пока мы просто сдвигаем игрока настолько, насколько он смог пройти.
+	test_transform.origin += result.travel;
+
+	// Считаем квадрат пройденного расстояния.
+	float fwd_traveled = result.travel.length_squared();
+	const float FWD_MIN = 0.001f;
+
+	print_line(vformat("[STEP_UP] STEP2_FWD:forward travel, travel = %.4f ", fwd_traveled));
+
+	if (fwd_traveled < FWD_MIN) {
+		// Мы пролетели вперед слишком мало. Значит уперлись носом в высокую стену.
+		print_line(vformat("[STEP_UP] STEP2_FWD: Not enough forward travel - skipping"));
+		return false;
+	}
+
+	// ================= ШАГ 3: ДВИЖЕМСЯ ВИРТУАЛЬНО ВНИЗ =================
+	// Игрок находится ВВЕРХУ и ВПЕРЕДИ ступеньки. Теперь с силой роняем его вниз.
+	// Опускаем его на ту высоту, на которую реально поднялись, ПЛЮС двойной margin.
+	Vector3 down_motion = -actual_up_travel - (up_direction * margin * 2.0f);
+	params = PhysicsServer3D::MotionParameters(test_transform, down_motion, margin);
+	params.recovery_as_collision = true;
+
+	// Тестируем падение вниз.
+	bool hit_ground = ps->body_test_motion(get_rid(), params, &result);
+
+	if (!hit_ground || result.collision_count == 0) {
+		// Мы летели вниз и ни во что не врезались. То есть под нами пропасть!
+		print_line(vformat("[STEP_UP] STEP3_DOWN: No ground found — skipping"));
+		return false;
+	}
+
+	print_line(vformat("[STEP_UP] STEP3_DOWN: ground normal=%s  ground_collider=%s", result.collisions[0].normal, result.collisions[0].collider_id));
+	// Применяем падение. Игрок "встал" на новую поверхность.
+	test_transform.origin += result.travel;
+
+	// Запоминаем позицию после этой сложной акробатики.
+	Vector3 final_position = test_transform.origin;
+
+	// ================= ПРОВЕРКА РЕЗУЛЬТАТА (Где мы в итоге оказались?) =================
+	float height_diff = (final_position - start_transform.origin).dot(up_direction);
+
+	print_line(vformat("[STEP_UP] height_diff=%.4f  final_pos=%s", height_diff, final_position));
+
+	if (height_diff > step_height + 0.001f) {
+		print_line(vformat("[STEP_UP] REJECTED: Step too high (%.4f > %.4f)", height_diff, step_height));
+		return false;
+	}
+
+	if (height_diff < 0.001f) {
+		print_line(vformat("[STEP_UP] height_diff too small (%.4f) — skipping", height_diff));
+		return false;
+	}
+
+	float max_angle_rad = floor_max_angle + FLOOR_ANGLE_THRESHOLD; // Максимальный угол
+	Vector3 valid_floor_normal = result.collisions[0].normal; // Нормаль поверхности
+	float angle_to_up = valid_floor_normal.angle_to(up_direction);
+	bool is_walkable = angle_to_up <= max_angle_rad;
+	bool step_success = false;
+
+	print_line(vformat("[STEP_UP] floor_max_angle=%.4f  FLOOR_ANGLE_THRESHOLD=%.4f, max_angle_rad=%.4f,", floor_max_angle, FLOOR_ANGLE_THRESHOLD, max_angle_rad));
+
+	if (is_walkable) {
+		// Идеально ровная поверхность (мы наступили на плоскость ступеньки сверху)
+		step_success = true;
+		print_line(vformat("[STEP_UP] NORMAL ACCEPTED  angle=%.4f  height_diff=%.4f", angle_to_up, height_diff));
+	} else {
+		// Нормаль крутая. Это либо высокая стена, ЛИБО мы задели острый угол ступеньки.
+		// Вычисляем высоту контакта (работает универсально для кубов, капсул и сфер).
+		Variant shape_data = ps->shape_get_data(shape_rid);
+		real_t shape_height = 2.0f;
+
+		if (type == PhysicsServer3D::SHAPE_SPHERE) {
+			real_t radius = shape_data;
+			shape_height = radius * 2.0f;
+		} else if (type == PhysicsServer3D::SHAPE_CAPSULE || type == PhysicsServer3D::SHAPE_CYLINDER) {
+			Dictionary dict = shape_data;
+			if (dict.has("height")) {
+				shape_height = dict["height"];
+			}
+		} else if (type == PhysicsServer3D::SHAPE_BOX) {
+			Vector3 extents = shape_data; // В Godot для Box возвращаются half-extents
+			shape_height = extents.y * 2.0f;
+		}
+
+		// Точка соприкосновения
+		Vector3 contact_point = result.collisions[0].position;
+
+		// Вычисляем координату старых "ног" до начала шага
+		Transform3D shape_transform = ps->body_get_shape_transform(get_rid(), 0);
+		Vector3 start_shape_origin = (start_transform * shape_transform).origin;
+		Vector3 start_bottom = start_shape_origin - up_direction * (shape_height * 0.5f);
+
+		// Насколько высоко этот контакт относительно наших старых "ног"?
+		float contact_height = (contact_point - start_bottom).dot(up_direction);
+
+		// Разрешаем погрешность в 1 см (чтобы маргины не ломали математику)
+		if (contact_height <= step_height + 0.01f) {
+			step_success = true;
+			valid_floor_normal = up_direction;
+			print_line(vformat("[STEP_UP] ROUND: EDGE SUCCESS (Contact height %.4f <= %.4f)", contact_height, step_height));
+		} else {
+			// Угол выше step_height. Игрок пытается зашагнуть на стену!
+			print_line(vformat("[STEP_UP]ROUND: REJECTED (Wall too high, contact_height=%.4f > %.4f)", contact_height, step_height));
+		}
+	}
+
+	if (step_success) {
+		// Применяем позицию
+		set_global_transform(Transform3D(start_transform.basis, final_position));
+		collision_state.floor = true;
+		floor_normal = valid_floor_normal;
+		Vector3 start_position = start_transform.origin;
+		last_motion = final_position - start_position;
+		return true;
+	}
+
+	return false;
 }
 
 void CharacterBody3D::_move_and_slide_floating(double p_delta) {
@@ -835,6 +1042,23 @@ void CharacterBody3D::set_floor_snap_length(real_t p_floor_snap_length) {
 	floor_snap_length = p_floor_snap_length;
 }
 
+bool CharacterBody3D::is_step_enabled() const {
+	return step_enabled;
+}
+
+void CharacterBody3D::set_step_enabled(bool p_enabled) {
+	step_enabled = p_enabled;
+}
+
+real_t CharacterBody3D::get_step_height() const {
+	return step_height;
+}
+
+void CharacterBody3D::set_step_height(real_t p_height) {
+	ERR_FAIL_COND(p_height < 0);
+	step_height = p_height;
+}
+
 real_t CharacterBody3D::get_wall_min_slide_angle() const {
 	return wall_min_slide_angle;
 }
@@ -862,7 +1086,8 @@ void CharacterBody3D::_notification(int p_what) {
 			motion_results.clear();
 			platform_velocity = Vector3();
 			platform_angular_velocity = Vector3();
-		} break;
+		}
+		break;
 	}
 }
 
@@ -895,6 +1120,10 @@ void CharacterBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_floor_max_angle", "radians"), &CharacterBody3D::set_floor_max_angle);
 	ClassDB::bind_method(D_METHOD("get_floor_snap_length"), &CharacterBody3D::get_floor_snap_length);
 	ClassDB::bind_method(D_METHOD("set_floor_snap_length", "floor_snap_length"), &CharacterBody3D::set_floor_snap_length);
+	ClassDB::bind_method(D_METHOD("is_step_enabled"), &CharacterBody3D::is_step_enabled);
+	ClassDB::bind_method(D_METHOD("set_step_enabled", "enabled"), &CharacterBody3D::set_step_enabled);
+	ClassDB::bind_method(D_METHOD("get_step_height"), &CharacterBody3D::get_step_height);
+	ClassDB::bind_method(D_METHOD("set_step_height", "height"), &CharacterBody3D::set_step_height);
 	ClassDB::bind_method(D_METHOD("get_wall_min_slide_angle"), &CharacterBody3D::get_wall_min_slide_angle);
 	ClassDB::bind_method(D_METHOD("set_wall_min_slide_angle", "radians"), &CharacterBody3D::set_wall_min_slide_angle);
 	ClassDB::bind_method(D_METHOD("get_up_direction"), &CharacterBody3D::get_up_direction);
@@ -935,6 +1164,9 @@ void CharacterBody3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "floor_block_on_wall"), "set_floor_block_on_wall_enabled", "is_floor_block_on_wall_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "floor_max_angle", PROPERTY_HINT_RANGE, "0,180,0.1,radians_as_degrees"), "set_floor_max_angle", "get_floor_max_angle");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "floor_snap_length", PROPERTY_HINT_RANGE, "0,1,0.01,or_greater,suffix:m"), "set_floor_snap_length", "get_floor_snap_length");
+	ADD_GROUP("Step", "step_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "step_enabled"), "set_step_enabled", "is_step_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "step_height", PROPERTY_HINT_RANGE, "0,1,0.01,or_greater,suffix:m"), "set_step_height", "get_step_height");
 
 	ADD_GROUP("Moving Platform", "platform_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "platform_on_leave", PROPERTY_HINT_ENUM, "Add Velocity,Add Upward Velocity,Do Nothing", PROPERTY_USAGE_DEFAULT), "set_platform_on_leave", "get_platform_on_leave");
@@ -957,12 +1189,12 @@ void CharacterBody3D::_validate_property(PropertyInfo &p_property) const {
 		return;
 	}
 	if (motion_mode == MOTION_MODE_FLOATING) {
-		if (p_property.name.begins_with("floor_") || p_property.name == "up_direction" || p_property.name == "slide_on_ceiling") {
+		if (p_property.name.begins_with("floor_") || p_property.name.begins_with("step_") || p_property.name == "up_direction" || p_property.name == "slide_on_ceiling") {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
 	}
 }
 
 CharacterBody3D::CharacterBody3D() :
-		PhysicsBody3D(PhysicsServer3D::BODY_MODE_KINEMATIC) {
+	PhysicsBody3D(PhysicsServer3D::BODY_MODE_KINEMATIC) {
 }
